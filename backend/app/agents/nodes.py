@@ -21,6 +21,19 @@ from app.services.scoring import rank_opportunity, validate_token
 from app.services.sentiment import analyze_sentiment
 from app.services.vector_store import embed_text, vector_store_from_settings
 
+DEFAULT_MARKET_IDS = [
+    "bitcoin",
+    "ethereum",
+    "solana",
+    "dogecoin",
+    "tron",
+    "hyperliquid",
+    "pudgy-penguins",
+    "pi-network",
+    "bio-protocol",
+    "terra-luna",
+]
+
 
 async def data_collector_node(state: AgentState, *, db: AsyncSession, coingecko: CoinGeckoClient, binance: BinanceClient) -> AgentState:
     run_id = state["run_id"]
@@ -30,27 +43,31 @@ async def data_collector_node(state: AgentState, *, db: AsyncSession, coingecko:
             trending = await coingecko.trending()
             logged["output"].update({"trending_count": len(trending), "sample": trending[:5]})
 
-        ids = [c["coingecko_id"] for c in trending if c.get("coingecko_id")]
+        ids = [c["coingecko_id"] for c in trending if c.get("coingecko_id")] or DEFAULT_MARKET_IDS
         async with log_step(db, run_id=run_id, agent="data_collector", step="fetch_markets", input={"ids": ids[:20]}) as logged:
             markets = await coingecko.markets(ids=ids[:20])
             logged["output"].update({"markets_count": len(markets)})
     except Exception as exc:  # noqa: BLE001
         async with log_step(db, run_id=run_id, agent="data_collector", step="cached_markets", input={"reason": type(exc).__name__}) as logged:
             cached = await latest_market_snapshots(db, limit=20)
-            markets = [
-                {
-                    **(market.raw or {}),
-                    "id": coin.coingecko_id,
-                    "symbol": coin.symbol,
-                    "name": coin.name,
-                    "current_price": market.price_usd,
-                    "total_volume": market.volume_24h_usd,
-                    "market_cap": market.market_cap_usd,
-                    "price_change_percentage_24h": market.change_24h_pct,
-                }
-                for coin, market in cached
-            ]
-            logged["output"].update({"markets_count": len(markets), "fallback": "latest_cached_market_data"})
+            if cached:
+                markets = [
+                    {
+                        **(market.raw or {}),
+                        "id": coin.coingecko_id,
+                        "symbol": coin.symbol,
+                        "name": coin.name,
+                        "current_price": market.price_usd,
+                        "total_volume": market.volume_24h_usd,
+                        "market_cap": market.market_cap_usd,
+                        "price_change_percentage_24h": market.change_24h_pct,
+                    }
+                    for coin, market in cached
+                ]
+                logged["output"].update({"markets_count": len(markets), "fallback": "latest_cached_market_data"})
+            else:
+                markets = await coingecko.markets(ids=DEFAULT_MARKET_IDS)
+                logged["output"].update({"markets_count": len(markets), "fallback": "default_market_universe"})
 
     coins: list[CoinContext] = []
     now = datetime.now(tz=timezone.utc)
@@ -262,6 +279,12 @@ async def ranking_node(state: AgentState, *, db: AsyncSession) -> AgentState:
 async def report_generator_node(state: AgentState, *, db: AsyncSession) -> AgentState:
     run_id = state["run_id"]
     coins = state["coins"]
+    if not coins:
+        async with log_step(db, run_id=run_id, agent="report", step="skipped", input={"coins": 0}) as logged:
+            logged["output"].update({"reason": "no_market_data"})
+        state["notes"].append("report_skipped=no_market_data")
+        return state
+
     coins_sorted = sorted(coins, key=lambda c: float((c.get("ranking") or {}).get("final_score") or 0.0), reverse=True)
 
     store = None

@@ -50,11 +50,14 @@ async def run_agents(db: AsyncSession = Depends(get_db)) -> RunAgentsResponse:
     ).scalar_one_or_none()
     if rep and rep.payload.get("run_id") == str(run_id):
         report_id = rep.id
+    notes = ["Pipeline executed. See /logs for step-by-step explainability."]
+    if any(l.agent == "report" and l.step == "skipped" for l in logs):
+        notes = ["Pipeline ran, but report generation was skipped because no market data was available."]
 
     return RunAgentsResponse(
         run_id=run_id,
         report_id=report_id,
         opportunities_created=opportunities_created,
         signals_created=signals_created,
-        notes=["Pipeline executed. See /logs for step-by-step explainability."],
+        notes=notes,
     )
